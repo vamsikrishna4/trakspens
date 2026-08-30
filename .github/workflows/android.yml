@@ -10,9 +10,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -22,26 +19,412 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Locate Project & Build
+      - name: Generate Code and Build APK
         run: |
-          # 1. Download Gradle binary
+          # 1. Create project directories
+          mkdir -p app/src/main/java/com/example/expensetracker
+          mkdir -p gradle/wrapper
+
+          # 2. settings.gradle.kts
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ExpenseTracker"
+          include(":app")
+          EOF
+
+          # 3. Root build.gradle.kts
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.3.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+              id("org.jetbrains.kotlin.kapt") version "1.9.22" apply false
+          }
+          EOF
+
+          # 4. app/build.gradle.kts
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("kotlin-kapt")
+          }
+
+          android {
+              namespace = "com.example.expensetracker"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.expensetracker"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.8"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+              implementation("androidx.activity:activity-compose:1.8.2")
+              implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+
+              implementation("androidx.room:room-runtime:2.6.1")
+              implementation("androidx.room:room-ktx:2.6.1")
+              kapt("androidx.room:room-compiler:2.6.1")
+          }
+          EOF
+
+          # 5. AndroidManifest.xml
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECEIVE_SMS" />
+              <uses-permission android:name="android.permission.READ_SMS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:label="Expense Tracker"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".NotificationService"
+                      android:label="Expense Notification Listener"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+
+                  <receiver
+                      android:name=".SmsReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BROADCAST_SMS">
+                      <intent-filter>
+                          <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          # 6. Database & Code
+          cat << 'EOF' > app/src/main/java/com/example/expensetracker/AppDatabase.kt
+          package com.example.expensetracker
+
+          import android.content.Context
+          import androidx.room.*
+          import kotlinx.coroutines.flow.Flow
+
+          @Entity(tableName = "expenses")
+          data class Expense(
+              @PrimaryKey(autoGenerate = true) val id: Int = 0,
+              val amount: Double,
+              val source: String,
+              val rawText: String,
+              val timestamp: Long = System.currentTimeMillis()
+          )
+
+          @Dao
+          interface ExpenseDao {
+              @Insert
+              suspend fun insert(expense: Expense)
+
+              @Query("SELECT SUM(amount) FROM expenses WHERE timestamp >= :monthStart")
+              fun getMonthlyTotal(monthStart: Long): Flow<Double?>
+          }
+
+          @Database(entities = [Expense::class], version = 1)
+          abstract class AppDatabase : RoomDatabase() {
+              abstract fun expenseDao(): ExpenseDao
+
+              companion object {
+                  @Volatile private var instance: AppDatabase? = null
+
+                  fun getDatabase(context: Context): AppDatabase =
+                      instance ?: synchronized(this) {
+                          instance ?: Room.databaseBuilder(
+                              context.applicationContext,
+                              AppDatabase::class.java, "expenses_db"
+                          ).build().also { instance = it }
+                      }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/expensetracker/TransactionParser.kt
+          package com.example.expensetracker
+
+          object TransactionParser {
+              private val regex = Regex("""(?i)(?:rs\.?|inr|spent|debited|paid|charged|txn of|usd|\$)\s*([\d,]+\.?\d{0,2})""")
+
+              fun extractAmount(text: String): Double? {
+                  val match = regex.find(text) ?: return null
+                  val rawNum = match.groupValues[1].replace(",", "")
+                  return rawNum.toDoubleOrNull()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/expensetracker/NotificationService.kt
+          package com.example.expensetracker
+
+          import android.app.Notification
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+
+          class NotificationService : NotificationListenerService() {
+              private val scope = CoroutineScope(Dispatchers.IO)
+
+              override fun onNotificationPosted(sbn: StatusBarNotification?) {
+                  sbn?.notification?.extras?.let { extras ->
+                      val title = extras.getString(Notification.EXTRA_TITLE) ?: ""
+                      val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+                      val fullContent = "$title $text"
+
+                      val amount = TransactionParser.extractAmount(fullContent)
+                      if (amount != null && amount > 0.0) {
+                          scope.launch {
+                              val db = AppDatabase.getDatabase(applicationContext)
+                              db.expenseDao().insert(
+                                  Expense(
+                                      amount = amount,
+                                      source = sbn.packageName,
+                                      rawText = fullContent
+                                  )
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/expensetracker/SmsReceiver.kt
+          package com.example.expensetracker
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.provider.Telephony
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+
+          class SmsReceiver : BroadcastReceiver() {
+              private val scope = CoroutineScope(Dispatchers.IO)
+
+              override fun onReceive(context: Context?, intent: Intent?) {
+                  if (context == null || intent?.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+
+                  val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+                  for (sms in messages) {
+                      val body = sms.displayMessageBody
+                      val amount = TransactionParser.extractAmount(body)
+                      if (amount != null && amount > 0.0) {
+                          scope.launch {
+                              val db = AppDatabase.getDatabase(context)
+                              db.expenseDao().insert(
+                                  Expense(
+                                      amount = amount,
+                                      source = "SMS: ${sms.displayOriginatingAddress}",
+                                      rawText = body
+                                  )
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/expensetracker/MainActivity.kt
+          package com.example.expensetracker
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import java.util.Calendar
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val db = AppDatabase.getDatabase(this)
+
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              ExpenseDashboard(
+                                  db = db,
+                                  onOpenSettings = {
+                                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                                  }
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ExpenseDashboard(db: AppDatabase, onOpenSettings: () -> Unit) {
+              val monthStart = remember {
+                  Calendar.getInstance().apply {
+                      set(Calendar.DAY_OF_MONTH, 1)
+                      set(Calendar.HOUR_OF_DAY, 0)
+                      set(Calendar.MINUTE, 0)
+                      set(Calendar.SECOND, 0)
+                  }.timeInMillis
+              }
+
+              val monthlySpent by db.expenseDao().getMonthlyTotal(monthStart).collectAsState(initial = 0.0)
+              var monthlyBudget by remember { mutableStateOf(50000.0) }
+
+              val spent = monthlySpent ?: 0.0
+              val remaining = (monthlyBudget - spent).coerceAtLeast(0.0)
+              val spentPct = ((spent / monthlyBudget) * 100).coerceIn(0.0, 100.0).toFloat()
+              val remainingPct = (100f - spentPct).coerceIn(0f, 100f)
+
+              Column(
+                  modifier = Modifier.fillMaxSize().padding(24.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.SpaceBetween
+              ) {
+                  Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                      Text("Monthly Expense Tracker", style = MaterialTheme.typography.headlineMedium)
+                      Spacer(modifier = Modifier.height(24.dp))
+
+                      Box(contentAlignment = Alignment.Center, modifier = Modifier.size(240.dp)) {
+                          Canvas(modifier = Modifier.size(200.dp)) {
+                              val strokeWidth = 36.dp.toPx()
+                              val sweepSpent = (spentPct / 100f) * 360f
+                              val sweepRemaining = (remainingPct / 100f) * 360f
+
+                              drawArc(
+                                  color = Color(0xFF4CAF50),
+                                  startAngle = -90f + sweepSpent,
+                                  sweepAngle = sweepRemaining,
+                                  useCenter = false,
+                                  style = Stroke(width = strokeWidth)
+                              )
+                              drawArc(
+                                  color = Color(0xFFE53935),
+                                  startAngle = -90f,
+                                  sweepAngle = sweepSpent,
+                                  useCenter = false,
+                                  style = Stroke(width = strokeWidth)
+                              )
+                          }
+
+                          Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                              Text("%.0f%%".format(remainingPct), fontSize = 32.sp, style = MaterialTheme.typography.titleLarge)
+                              Text("Left", style = MaterialTheme.typography.bodyMedium)
+                          }
+                      }
+
+                      Spacer(modifier = Modifier.height(32.dp))
+
+                      Card(
+                          shape = RoundedCornerShape(12.dp),
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Column(modifier = Modifier.padding(16.dp)) {
+                              Row(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  horizontalArrangement = Arrangement.SpaceBetween
+                              ) {
+                                  Text("Budget:")
+                                  Text("₹%.2f".format(monthlyBudget))
+                              }
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Row(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  horizontalArrangement = Arrangement.SpaceBetween
+                              ) {
+                                  Text("Spent (Red):", color = Color(0xFFE53935))
+                                  Text("₹%.2f".format(spent), color = Color(0xFFE53935))
+                              }
+                              Spacer(modifier = Modifier.height(8.dp))
+                              Row(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  horizontalArrangement = Arrangement.SpaceBetween
+                              ) {
+                                  Text("Remaining (Green):", color = Color(0xFF4CAF50))
+                                  Text("₹%.2f".format(remaining), color = Color(0xFF4CAF50))
+                              }
+                          }
+                      }
+                  }
+
+                  Button(
+                      onClick = onOpenSettings,
+                      modifier = Modifier.fillMaxWidth()
+                  ) {
+                      Text("Grant Notification Listener Permission")
+                  }
+              }
+          }
+          EOF
+
+          # 7. Download Gradle 8.4 and Build
           wget https://services.gradle.org/distributions/gradle-8.4-bin.zip -O gradle.zip
           unzip -q gradle.zip
           export PATH=$PWD/gradle-8.4/bin:$PATH
-
-          # 2. Find where settings.gradle / settings.gradle.kts actually lives
-          PROJECT_DIR=$(dirname $(find . -maxdepth 3 -name "settings.gradle*" | head -n 1))
           
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "Error: Could not find settings.gradle.kts anywhere in the repo!"
-            ls -la
-            exit 1
-          fi
-
-          echo "Found Gradle project in: $PROJECT_DIR"
-          cd "$PROJECT_DIR"
-
-          # 3. Generate wrapper and assemble
           gradle wrapper
           ./gradlew assembleDebug --stacktrace --no-daemon
 
@@ -49,4 +432,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: "**/build/outputs/apk/debug/*.apk"
+          path: app/build/outputs/apk/debug/*.apk
