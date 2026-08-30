@@ -22,14 +22,26 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Generate Gradle Wrapper and Build APK
+      - name: Locate Project & Build
         run: |
-          # Download Gradle 8.4 binary directly
+          # 1. Download Gradle binary
           wget https://services.gradle.org/distributions/gradle-8.4-bin.zip -O gradle.zip
           unzip -q gradle.zip
           export PATH=$PWD/gradle-8.4/bin:$PATH
+
+          # 2. Find where settings.gradle / settings.gradle.kts actually lives
+          PROJECT_DIR=$(dirname $(find . -maxdepth 3 -name "settings.gradle*" | head -n 1))
           
-          # Run the build
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Error: Could not find settings.gradle.kts anywhere in the repo!"
+            ls -la
+            exit 1
+          fi
+
+          echo "Found Gradle project in: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+
+          # 3. Generate wrapper and assemble
           gradle wrapper
           ./gradlew assembleDebug --stacktrace --no-daemon
 
@@ -37,4 +49,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          path: "**/build/outputs/apk/debug/*.apk"
