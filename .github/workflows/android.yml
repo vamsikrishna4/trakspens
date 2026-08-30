@@ -22,10 +22,16 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install and Build with Gradle
+      - name: Generate Gradle Wrapper and Build APK
         run: |
-          sudo apt-get update && sudo apt-get install -y gradle
-          gradle assembleDebug --stacktrace --no-daemon
+          # Download Gradle 8.4 binary directly
+          wget https://services.gradle.org/distributions/gradle-8.4-bin.zip -O gradle.zip
+          unzip -q gradle.zip
+          export PATH=$PWD/gradle-8.4/bin:$PATH
+          
+          # Run the build
+          gradle wrapper
+          ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
